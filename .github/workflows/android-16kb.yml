@@ -1,0 +1,71 @@
+name: Android arm64 (16 KB pages)
+
+# StatusCraft: libnode.so for arm64-v8a, linked for 16 KB page sizes as Google
+# Play requires. Run by hand; the result is attached to a GitHub release.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build utils
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r24
+          add-to-path: false
+
+      # Let CC_host/CXX_host be overridden (nodejs-mobile#161): some host g++
+      # versions crash while compiling V8's host tools.
+      - name: Allow a host compiler override
+        run: |
+          sed -i "s/^os.environ\['CC_host'\] = /os.environ.setdefault('CC_host', /; s/^os.environ\['CXX_host'\] = /os.environ.setdefault('CXX_host', /" android_configure.py
+          sed -i "/setdefault('C[CX]*_host'/ s/\.strip()$/.strip())/" android_configure.py
+          grep -n "_host" android_configure.py
+
+      - name: Build
+        env:
+          NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
+          LDFLAGS: '-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384'
+        run: |
+          export CC_host=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang
+          export CXX_host=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++
+          ./tools/android_build.sh "$NDK" 24 arm64
+          find out_android -name '*.so' -exec ls -l {} \;
+
+      - name: Check alignment
+        run: |
+          so=$(find out_android -name libnode.so | head -1)
+          readelf -lW "$so" | grep LOAD
+          ! readelf -lW "$so" | awk '/LOAD/ {print $NF}' | grep -qv 0x4000
+
+      - name: Package
+        run: |
+          so=$(find out_android -name libnode.so | head -1)
+          mkdir -p dist && cp "$so" dist/libnode.so && strip --version >/dev/null
+          sha256sum dist/libnode.so | tee dist/libnode.so.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libnode-android-arm64-16kb
+          path: dist
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="android-arm64-16kb-${GITHUB_SHA::7}"
+          gh release create "$tag" dist/libnode.so dist/libnode.so.sha256 \
+            --target "$GITHUB_SHA" --title "libnode.so arm64-v8a, 16 KB pages" \
+            --notes "Built from ${GITHUB_SHA} with LDFLAGS -z max-page-size=16384, NDK r24, API 24."
